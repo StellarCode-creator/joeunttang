@@ -1,0 +1,107 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    container_name: proptech_db
+    environment:
+      POSTGRES_DB: proptech
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  redis:
+    image: redis:7
+    container_name: proptech_redis
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  opensearch:
+    image: opensearchproject/opensearch:2
+    container_name: proptech_opensearch
+    environment:
+      discovery.type: single-node
+      plugins.security.disabled: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "9200:9200"
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+    restart: unless-stopped
+
+  api:
+    build: ./backend
+    container_name: proptech_api
+    env_file:
+      - ./backend/.env
+    environment:
+      PGHOST: db
+      PGPORT: 5432
+      PGDATABASE: proptech
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      OPENSEARCH_URL: http://opensearch:9200
+    depends_on:
+      - db
+      - redis
+    ports:
+      - "3001:3001"
+    restart: unless-stopped
+
+  web:
+    image: node:20
+    container_name: proptech_web
+    working_dir: /app
+    volumes:
+      - ./frontend:/app
+    command: ["sh", "-lc", "npm install && npm run dev"]
+    environment:
+      NEXT_PUBLIC_API_BASE: "http://localhost:3001"
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  etl:
+    build:
+      context: .
+      dockerfile: ./etl/Dockerfile
+    container_name: proptech_etl
+    env_file:
+      - ./backend/.env
+    environment:
+      PGHOST: db
+      PGPORT: 5432
+      PGDATABASE: proptech
+      PGUSER: postgres
+      PGPASSWORD: postgres
+    volumes:
+      - ./:/app
+    depends_on:
+      - db
+    restart: "no"
+    # 기본은 daily. 필요할 때 compose run으로 모드 바꿔서 실행.
+    command: ["python", "etl/run_pipeline.py", "--mode", "daily"]
+
+volumes:
+  pg_data:
+  redis_data:
+  opensearch_data:
