@@ -1,3 +1,4 @@
+// frontend/src/app/components/sidebar/modules/RecentTrades3Months.tsx
 "use client";
 
 import { useEffect, useState } from "react";
@@ -29,8 +30,10 @@ function formatKoreanMoneyManwon(v: number) {
 
 export default function RecentTrades3Months({
   selectedApt,
+  onOpenMore,
 }: {
   selectedApt: SelectedApt | null;
+  onOpenMore: () => void;
 }) {
   const [items, setItems] = useState<RecentTradeItem[]>([]);
   const [loading, setLoading] = useState(false);
@@ -75,11 +78,30 @@ export default function RecentTrades3Months({
     };
   }, [selectedApt]);
 
+  const canOpenMore = !!selectedApt && !loading && items.length > 0;
+
   return (
     <section className="mt-4 rounded-xl bg-white p-4 shadow-sm">
       <div className="mb-3 flex items-center justify-between">
         <h3 className="text-sm font-bold text-gray-900">최근 3개월 실거래 (Top 5)</h3>
-        <span className="text-xs text-gray-500">{loading ? "로딩…" : ""}</span>
+
+        <div className="flex items-center gap-3">
+          <span className="text-xs text-gray-500">{loading ? "로딩…" : ""}</span>
+
+          <button
+            type="button"
+            onClick={() => (canOpenMore ? onOpenMore() : null)}
+            disabled={!canOpenMore}
+            className={[
+              "rounded-md px-2 py-1 text-xs font-semibold transition",
+              canOpenMore
+                ? "text-[#635BFF] hover:bg-[#F4F7FF]"
+                : "cursor-not-allowed text-gray-300",
+            ].join(" ")}
+          >
+            더 보기
+          </button>
+        </div>
       </div>
 
       {!selectedApt ? (

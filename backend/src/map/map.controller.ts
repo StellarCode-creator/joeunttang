@@ -1,3 +1,4 @@
+// backend/src/map/map.controller.ts
 import { Controller, Get, Query, BadRequestException } from '@nestjs/common';
 import { getPool } from '../db';
 
@@ -7,11 +8,6 @@ function toNum(v: string | undefined) {
   return Number.isFinite(n) ? n : null;
 }
 
-/**
- * deal_ymd가 YYYYMMDD(8) 또는 YYYYMM(6)로 들어올 수 있어 안전하게 date로 변환
- * - 8자리: 그대로 YYYYMMDD
- * - 6자리: YYYYMM01로 간주
- */
 const DEAL_DATE_EXPR = `
   CASE
     WHEN length(t.deal_ymd) = 8 THEN to_date(t.deal_ymd, 'YYYYMMDD')
@@ -20,7 +16,6 @@ const DEAL_DATE_EXPR = `
   END
 `;
 
-/** jibun은 옵션 필터: 값이 비어있으면 무시, 있으면 trim 비교 */
 const JIBUN_OPT_FILTER = `
   (
     btrim(COALESCE($3, '')) = ''
@@ -28,14 +23,17 @@ const JIBUN_OPT_FILTER = `
   )
 `;
 
+const PARAM_DATE_EXPR = (idx: number) => `
+  CASE
+    WHEN btrim(COALESCE($${idx}, '')) = '' THEN NULL
+    WHEN length(btrim($${idx})) = 8 THEN to_date(btrim($${idx}), 'YYYYMMDD')
+    WHEN length(btrim($${idx})) = 6 THEN to_date(btrim($${idx}) || '01', 'YYYYMMDD')
+    ELSE NULL
+  END
+`;
+
 @Controller('api/map')
 export class MapController {
-  /**
-   * ✅ 지도 클러스터(단지 목록)
-   * - 지번으로 join 하지 않음
-   * - 단지 식별은 (lawd_cd, apt_nm)
-   * - 좌표는 apt_location에서 (lawd_cd, apt_nm) 대표 1건을 뽑아 사용
-   */
   @Get('trades')
   async trades(
     @Query('swLat') swLatS: string,
@@ -105,7 +103,6 @@ export class MapController {
         lawdCd: String(r.lawd_cd ?? '').trim(),
         umdNm: String(r.umd_nm ?? '').trim(),
         aptNm: String(r.apt_nm ?? '').trim(),
-        // ✅ 지번은 내려주지 않는다(단지 식별에 사용 금지)
         lat: Number(r.lat),
         lng: Number(r.lng),
         tradeCnt: Number(r.trade_cnt),
@@ -116,51 +113,83 @@ export class MapController {
     };
   }
 
-  // ✅ 단지 선택 후: 최근 3개월 최신 N건
   @Get('apt/recent-trades')
   async recentTrades(
     @Query('lawdCd') lawdCd: string,
     @Query('aptNm') aptNm: string,
     @Query('jibun') jibun: string,
     @Query('limit') limitS?: string,
+    @Query('fromYmd') fromYmd?: string,
+    @Query('toYmd') toYmd?: string,
   ) {
-    const limit = Math.min(Math.max(toNum(limitS) ?? 5, 1), 20);
+    const limit = Math.min(Math.max(toNum(limitS) ?? 5, 1), 5000);
     if (!lawdCd || !aptNm) throw new BadRequestException('lawdCd and aptNm are required');
 
     const pool = getPool();
 
+    const fromExpr = PARAM_DATE_EXPR(5);
+    const toExpr = PARAM_DATE_EXPR(6);
+
     const sql = `
+      WITH p AS (
+        SELECT
+          (${fromExpr}) AS from_d,
+          (${toExpr}) AS to_d
+      )
       SELECT
         t.id::text AS id,
         t.deal_ymd,
         t.deal_amount_manwon,
         t.exclu_use_ar,
-        t.floor
+        t.floor,
+        NULLIF(btrim(t.apt_dong::text), '') AS deal_dong,
+        NULLIF(btrim(t.rgst_date::text), '') AS rgst_date
       FROM apt_trade t
+      CROSS JOIN p
       WHERE
         t.lawd_cd = $1
         AND t.apt_nm = $2
         AND ${JIBUN_OPT_FILTER}
-        AND (${DEAL_DATE_EXPR}) >= (CURRENT_DATE - INTERVAL '3 months')
+        AND (
+          (p.from_d IS NULL AND p.to_d IS NULL AND (${DEAL_DATE_EXPR}) >= (CURRENT_DATE - INTERVAL '3 months'))
+          OR
+          (
+            (p.from_d IS NULL OR (${DEAL_DATE_EXPR}) >= p.from_d)
+            AND
+            (p.to_d IS NULL OR (${DEAL_DATE_EXPR}) <= p.to_d)
+          )
+        )
       ORDER BY (${DEAL_DATE_EXPR}) DESC NULLS LAST, t.deal_ymd DESC
       LIMIT $4;
     `;
 
-    const { rows } = await pool.query(sql, [lawdCd, aptNm, jibun ?? '', limit]);
+    const { rows } = await pool.query(sql, [
+      lawdCd,
+      aptNm,
+      jibun ?? '',
+      limit,
+      fromYmd ?? '',
+      toYmd ?? '',
+    ]);
 
     return {
       ok: true,
-      items: rows.map((r: any) => ({
-        id: r.id,
-        dealYmd: r.deal_ymd,
-        amountManwon: r.deal_amount_manwon,
-        excluUseAr: r.exclu_use_ar === null ? null : Number(r.exclu_use_ar),
-        floor: r.floor === null ? null : Number(r.floor),
-      })),
+      items: rows.map((r: any) => {
+        const rgst = r.rgst_date ? String(r.rgst_date).trim() : '';
+        return {
+          id: r.id,
+          dealYmd: r.deal_ymd,
+          amountManwon: r.deal_amount_manwon,
+          excluUseAr: r.exclu_use_ar === null ? null : Number(r.exclu_use_ar),
+          floor: r.floor === null ? null : Number(r.floor),
+          dealDong: r.deal_dong === null ? null : String(r.deal_dong),
+          // ✅ rgst_date가 비어있으면 "미등기"로 확정하지 말고 "미확인(null)" 처리
+          isRegistered: rgst ? true : null,
+        };
+      }),
     };
   }
 
-  // ✅ Summary: 최근 3개월 평균 + 최근 36개월 월평균 시계열
   @Get('apt/summary')
   async aptSummary(
     @Query('lawdCd') lawdCd: string,
@@ -171,7 +200,6 @@ export class MapController {
 
     const pool = getPool();
 
-    // 1) 단지 기본 정보(umd_nm은 trade에서 가져옴) - jibun은 옵션
     const aptSql = `
       SELECT
         t.lawd_cd,
@@ -187,7 +215,6 @@ export class MapController {
       LIMIT 1;
     `;
 
-    // 2) 최근 3개월 평균
     const last3mSql = `
       SELECT
         COALESCE(ROUND(AVG(t.deal_amount_manwon))::int, 0) AS avg_price,
@@ -200,7 +227,6 @@ export class MapController {
         AND (${DEAL_DATE_EXPR}) >= (CURRENT_DATE - INTERVAL '3 months');
     `;
 
-    // 3) 최근 36개월 월평균 시계열
     const seriesSql = `
       SELECT
         to_char(date_trunc('month', (${DEAL_DATE_EXPR})), 'YYYYMM') AS ym,
