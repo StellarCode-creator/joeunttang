@@ -1,274 +1,142 @@
 // backend/src/map/map.controller.ts
-import { Controller, Get, Query, BadRequestException } from '@nestjs/common';
+import { Controller, Get, Query, BadRequestException, Param, Res } from '@nestjs/common';
+import type { Response } from 'express';
 import { getPool } from '../db';
-
-function toNum(v: string | undefined) {
-  if (v === undefined) return null;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
-}
-
-const DEAL_DATE_EXPR = `
-  CASE
-    WHEN length(t.deal_ymd) = 8 THEN to_date(t.deal_ymd, 'YYYYMMDD')
-    WHEN length(t.deal_ymd) = 6 THEN to_date(t.deal_ymd || '01', 'YYYYMMDD')
-    ELSE NULL
-  END
-`;
-
-const JIBUN_OPT_FILTER = `
-  (
-    btrim(COALESCE($3, '')) = ''
-    OR btrim(COALESCE(t.jibun, '')) = btrim($3)
-  )
-`;
-
-const PARAM_DATE_EXPR = (idx: number) => `
-  CASE
-    WHEN btrim(COALESCE($${idx}, '')) = '' THEN NULL
-    WHEN length(btrim($${idx})) = 8 THEN to_date(btrim($${idx}), 'YYYYMMDD')
-    WHEN length(btrim($${idx})) = 6 THEN to_date(btrim($${idx}) || '01', 'YYYYMMDD')
-    ELSE NULL
-  END
-`;
+import { toInt, DEAL_DATE_EXPR, RENT_DATE_EXPR } from '../domains/apt/apt.shared';
 
 @Controller('api/map')
 export class MapController {
-  @Get('trades')
-  async trades(
-    @Query('swLat') swLatS: string,
-    @Query('swLng') swLngS: string,
-    @Query('neLat') neLatS: string,
-    @Query('neLng') neLngS: string,
-    @Query('limit') limitS?: string,
+  // ✅ MVT (기존 기능 유지) - 여기만 map에 남긴다.
+  @Get('tiles/:z/:x/:y.mvt')
+  async tile(
+    @Param('z') zS: string,
+    @Param('x') xS: string,
+    @Param('y') yS: string,
+    @Query('layer') layerS?: string,
+    @Query('rentType') rentTypeS?: string,
+    @Res() res?: Response,
   ) {
-    const swLat = toNum(swLatS);
-    const swLng = toNum(swLngS);
-    const neLat = toNum(neLatS);
-    const neLng = toNum(neLngS);
-    const limit = Math.min(Math.max(toNum(limitS) ?? 400, 1), 1000);
+    const z = toInt(zS);
+    const x = toInt(xS);
+    const y = toInt(yS);
+    const layer = (layerS ?? 'trades').trim();
+    const rentType = (rentTypeS ?? 'all').trim();
 
-    if (
-      swLat === null ||
-      swLng === null ||
-      neLat === null ||
-      neLng === null ||
-      swLat > neLat ||
-      swLng > neLng
-    ) {
-      throw new BadRequestException('Invalid bbox params');
+    if (z === null || x === null || y === null) throw new BadRequestException('Invalid z/x/y');
+    if (z < 0 || z > 22 || x < 0 || y < 0) throw new BadRequestException('Invalid tile coords');
+    if (layer !== 'trades' && layer !== 'rent') throw new BadRequestException('layer must be trades|rent');
+    if (!['all', 'jeonse', 'monthly'].includes(rentType)) {
+      throw new BadRequestException('rentType must be all|jeonse|monthly');
     }
 
     const pool = getPool();
+    const extent = 4096;
 
-    const sql = `
-      WITH rep_location AS (
+    const sqlTrades = `
+      WITH
+      bounds AS (SELECT ST_TileEnvelope($1, $2, $3) AS geom),
+      rep_location AS (
         SELECT DISTINCT ON (lawd_cd, apt_nm)
-          lawd_cd,
-          apt_nm,
-          umd_nm,
-          lat,
-          lng
+          lawd_cd, apt_nm, umd_nm, lat, lng
         FROM apt_location
+        WHERE lat IS NOT NULL AND lng IS NOT NULL
         ORDER BY lawd_cd, apt_nm, id
-      )
-      SELECT
-        t.lawd_cd,
-        rl.umd_nm,
-        t.apt_nm,
-        rl.lat,
-        rl.lng,
-        COUNT(*)::int AS trade_cnt,
-        MIN(t.deal_amount_manwon)::int AS min_price,
-        MAX(t.deal_amount_manwon)::int AS max_price,
-        MAX(t.deal_ymd) AS last_trade_ymd
-      FROM apt_trade t
-      JOIN rep_location rl
-        ON t.lawd_cd = rl.lawd_cd
-       AND t.apt_nm = rl.apt_nm
-      WHERE
-        rl.lat BETWEEN $1 AND $2
-        AND rl.lng BETWEEN $3 AND $4
-        AND (${DEAL_DATE_EXPR}) >= (CURRENT_DATE - INTERVAL '3 months')
-      GROUP BY t.lawd_cd, rl.umd_nm, t.apt_nm, rl.lat, rl.lng
-      ORDER BY last_trade_ymd DESC
-      LIMIT $5;
-    `;
-
-    const { rows } = await pool.query(sql, [swLat, neLat, swLng, neLng, limit]);
-
-    return {
-      ok: true,
-      items: rows.map((r: any) => ({
-        lawdCd: String(r.lawd_cd ?? '').trim(),
-        umdNm: String(r.umd_nm ?? '').trim(),
-        aptNm: String(r.apt_nm ?? '').trim(),
-        lat: Number(r.lat),
-        lng: Number(r.lng),
-        tradeCnt: Number(r.trade_cnt),
-        minPrice: Number(r.min_price),
-        maxPrice: Number(r.max_price),
-        lastTradeYmd: String(r.last_trade_ymd ?? ''),
-      })),
-    };
-  }
-
-  @Get('apt/recent-trades')
-  async recentTrades(
-    @Query('lawdCd') lawdCd: string,
-    @Query('aptNm') aptNm: string,
-    @Query('jibun') jibun: string,
-    @Query('limit') limitS?: string,
-    @Query('fromYmd') fromYmd?: string,
-    @Query('toYmd') toYmd?: string,
-  ) {
-    const limit = Math.min(Math.max(toNum(limitS) ?? 5, 1), 5000);
-    if (!lawdCd || !aptNm) throw new BadRequestException('lawdCd and aptNm are required');
-
-    const pool = getPool();
-
-    const fromExpr = PARAM_DATE_EXPR(5);
-    const toExpr = PARAM_DATE_EXPR(6);
-
-    const sql = `
-      WITH p AS (
+      ),
+      agg AS (
         SELECT
-          (${fromExpr}) AS from_d,
-          (${toExpr}) AS to_d
+          t.lawd_cd, rl.umd_nm, t.apt_nm, rl.lat, rl.lng,
+          COUNT(*)::int AS trade_cnt,
+          MIN(t.deal_amount_manwon)::int AS min_price,
+          MAX(t.deal_amount_manwon)::int AS max_price,
+          MAX(t.deal_ymd) AS last_trade_ymd
+        FROM apt_trade t
+        JOIN rep_location rl ON t.lawd_cd = rl.lawd_cd AND t.apt_nm = rl.apt_nm
+        WHERE (${DEAL_DATE_EXPR}) >= (CURRENT_DATE - INTERVAL '3 months')
+        GROUP BY t.lawd_cd, rl.umd_nm, t.apt_nm, rl.lat, rl.lng
       )
       SELECT
-        t.id::text AS id,
-        t.deal_ymd,
-        t.deal_amount_manwon,
-        t.exclu_use_ar,
-        t.floor,
-        NULLIF(btrim(t.apt_dong::text), '') AS deal_dong,
-        NULLIF(btrim(t.rgst_date::text), '') AS rgst_date
-      FROM apt_trade t
-      CROSS JOIN p
-      WHERE
-        t.lawd_cd = $1
-        AND t.apt_nm = $2
-        AND ${JIBUN_OPT_FILTER}
-        AND (
-          (p.from_d IS NULL AND p.to_d IS NULL AND (${DEAL_DATE_EXPR}) >= (CURRENT_DATE - INTERVAL '3 months'))
-          OR
-          (
-            (p.from_d IS NULL OR (${DEAL_DATE_EXPR}) >= p.from_d)
-            AND
-            (p.to_d IS NULL OR (${DEAL_DATE_EXPR}) <= p.to_d)
-          )
+        ST_AsMVT(tile, $4, $5, 'geom') AS mvt
+      FROM (
+        SELECT
+          ST_AsMVTGeom(
+            ST_Transform(ST_SetSRID(ST_MakePoint(agg.lng, agg.lat), 4326), 3857),
+            bounds.geom,
+            $5,
+            256,
+            true
+          ) AS geom,
+          agg.lawd_cd, agg.umd_nm, agg.apt_nm,
+          agg.trade_cnt, agg.min_price, agg.max_price, agg.last_trade_ymd
+        FROM agg, bounds
+        WHERE ST_Intersects(
+          ST_Transform(ST_SetSRID(ST_MakePoint(agg.lng, agg.lat), 4326), 3857),
+          bounds.geom
         )
-      ORDER BY (${DEAL_DATE_EXPR}) DESC NULLS LAST, t.deal_ymd DESC
-      LIMIT $4;
+      ) AS tile;
     `;
 
-    const { rows } = await pool.query(sql, [
-      lawdCd,
-      aptNm,
-      jibun ?? '',
-      limit,
-      fromYmd ?? '',
-      toYmd ?? '',
-    ]);
-
-    return {
-      ok: true,
-      items: rows.map((r: any) => {
-        const rgst = r.rgst_date ? String(r.rgst_date).trim() : '';
-        return {
-          id: r.id,
-          dealYmd: r.deal_ymd,
-          amountManwon: r.deal_amount_manwon,
-          excluUseAr: r.exclu_use_ar === null ? null : Number(r.exclu_use_ar),
-          floor: r.floor === null ? null : Number(r.floor),
-          dealDong: r.deal_dong === null ? null : String(r.deal_dong),
-          // ✅ rgst_date가 비어있으면 "미등기"로 확정하지 말고 "미확인(null)" 처리
-          isRegistered: rgst ? true : null,
-        };
-      }),
-    };
-  }
-
-  @Get('apt/summary')
-  async aptSummary(
-    @Query('lawdCd') lawdCd: string,
-    @Query('aptNm') aptNm: string,
-    @Query('jibun') jibun: string,
-  ) {
-    if (!lawdCd || !aptNm) throw new BadRequestException('lawdCd and aptNm are required');
-
-    const pool = getPool();
-
-    const aptSql = `
+    const sqlRent = `
+      WITH
+      bounds AS (SELECT ST_TileEnvelope($1, $2, $3) AS geom),
+      rep_location AS (
+        SELECT DISTINCT ON (lawd_cd, apt_nm)
+          lawd_cd, apt_nm, umd_nm, lat, lng
+        FROM apt_location
+        WHERE lat IS NOT NULL AND lng IS NOT NULL
+        ORDER BY lawd_cd, apt_nm, id
+      ),
+      base AS (
+        SELECT
+          r.lawd_cd, rl.umd_nm, r.apt_nm, rl.lat, rl.lng,
+          COUNT(*)::int AS rent_cnt,
+          MIN(r.deposit_manwon)::int AS min_deposit,
+          MAX(r.deposit_manwon)::int AS max_deposit,
+          MIN(COALESCE(r.monthly_rent_manwon, 0))::int AS min_monthly_rent,
+          MAX(COALESCE(r.monthly_rent_manwon, 0))::int AS max_monthly_rent,
+          MAX(r.deal_ymd) AS last_deal_ymd
+        FROM apt_trade_rent r
+        JOIN rep_location rl ON r.lawd_cd = rl.lawd_cd AND r.apt_nm = rl.apt_nm
+        WHERE (${RENT_DATE_EXPR}) >= (CURRENT_DATE - INTERVAL '3 months')
+          AND (
+            $6 = 'all'
+            OR ($6 = 'jeonse' AND COALESCE(r.monthly_rent_manwon, 0) = 0)
+            OR ($6 = 'monthly' AND COALESCE(r.monthly_rent_manwon, 0) > 0)
+          )
+        GROUP BY r.lawd_cd, rl.umd_nm, r.apt_nm, rl.lat, rl.lng
+      )
       SELECT
-        t.lawd_cd,
-        MAX(t.umd_nm) AS umd_nm,
-        t.apt_nm,
-        btrim(COALESCE($3, '')) AS jibun
-      FROM apt_trade t
-      WHERE
-        t.lawd_cd = $1
-        AND t.apt_nm = $2
-        AND ${JIBUN_OPT_FILTER}
-      GROUP BY t.lawd_cd, t.apt_nm, btrim(COALESCE($3, ''))
-      LIMIT 1;
+        ST_AsMVT(tile, $4, $5, 'geom') AS mvt
+      FROM (
+        SELECT
+          ST_AsMVTGeom(
+            ST_Transform(ST_SetSRID(ST_MakePoint(base.lng, base.lat), 4326), 3857),
+            bounds.geom,
+            $5,
+            256,
+            true
+          ) AS geom,
+          base.lawd_cd, base.umd_nm, base.apt_nm,
+          base.rent_cnt, base.min_deposit, base.max_deposit,
+          base.min_monthly_rent, base.max_monthly_rent, base.last_deal_ymd
+        FROM base, bounds
+        WHERE ST_Intersects(
+          ST_Transform(ST_SetSRID(ST_MakePoint(base.lng, base.lat), 4326), 3857),
+          bounds.geom
+        )
+      ) AS tile;
     `;
 
-    const last3mSql = `
-      SELECT
-        COALESCE(ROUND(AVG(t.deal_amount_manwon))::int, 0) AS avg_price,
-        COUNT(*)::int AS cnt
-      FROM apt_trade t
-      WHERE
-        t.lawd_cd = $1
-        AND t.apt_nm = $2
-        AND ${JIBUN_OPT_FILTER}
-        AND (${DEAL_DATE_EXPR}) >= (CURRENT_DATE - INTERVAL '3 months');
-    `;
+    const sql = layer === 'trades' ? sqlTrades : sqlRent;
+    const params = layer === 'trades' ? [z, x, y, layer, extent] : [z, x, y, layer, extent, rentType];
 
-    const seriesSql = `
-      SELECT
-        to_char(date_trunc('month', (${DEAL_DATE_EXPR})), 'YYYYMM') AS ym,
-        ROUND(AVG(t.deal_amount_manwon))::int AS avg_price,
-        COUNT(*)::int AS cnt
-      FROM apt_trade t
-      WHERE
-        t.lawd_cd = $1
-        AND t.apt_nm = $2
-        AND ${JIBUN_OPT_FILTER}
-        AND (${DEAL_DATE_EXPR}) >= (date_trunc('month', CURRENT_DATE) - INTERVAL '35 months')
-        AND (${DEAL_DATE_EXPR}) IS NOT NULL
-      GROUP BY ym
-      ORDER BY ym ASC;
-    `;
+    const { rows } = await pool.query<{ mvt: Buffer | null }>(sql, params);
+    const mvt = rows[0]?.mvt;
 
-    const [aptR, last3mR, seriesR] = await Promise.all([
-      pool.query(aptSql, [lawdCd, aptNm, jibun ?? '']),
-      pool.query(last3mSql, [lawdCd, aptNm, jibun ?? '']),
-      pool.query(seriesSql, [lawdCd, aptNm, jibun ?? '']),
-    ]);
+    if (!mvt || !res) throw new BadRequestException('Empty tile');
 
-    const apt = aptR.rows[0];
-    const last3m = last3mR.rows[0];
-
-    return {
-      ok: true,
-      apt: {
-        lawdCd: apt?.lawd_cd ?? lawdCd,
-        umdNm: apt?.umd_nm ?? '',
-        aptNm: apt?.apt_nm ?? aptNm,
-        jibun: apt?.jibun ?? (jibun ?? ''),
-      },
-      last3m: {
-        avgPrice: Number(last3m?.avg_price ?? 0),
-        cnt: Number(last3m?.cnt ?? 0),
-      },
-      series: (seriesR.rows ?? []).map((r: any) => ({
-        ym: String(r.ym),
-        avgPrice: Number(r.avg_price),
-        cnt: Number(r.cnt),
-      })),
-    };
+    res.setHeader('Content-Type', 'application/vnd.mapbox-vector-tile');
+    res.setHeader('Content-Encoding', 'gzip');
+    res.setHeader('Cache-Control', 'public, max-age=60');
+    res.end(mvt);
   }
 }

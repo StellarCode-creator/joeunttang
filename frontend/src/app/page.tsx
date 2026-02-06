@@ -1,59 +1,54 @@
 // frontend/src/app/page.tsx
 "use client";
 
-import { useEffect, useState } from "react";
+import { useMemo, useState } from "react";
 import SidebarMain from "@/components/sidebar/SidebarMain";
 import RightMapKakao from "@/components/map/RightMapKakao";
 import SidebarTradeDetail from "@/components/sidebar/SidebarTradeDetail";
 
+export type DealMode = "trade" | "jeonse" | "monthly";
+
 export type SelectedApt = {
   lawdCd: string;
   aptNm: string;
-  // ✅ jibun은 신뢰 불가: optional로 전환 (또는 제거 가능)
   jibun?: string;
   umdNm?: string;
 };
 
 export default function Page() {
+  const [dealMode, setDealMode] = useState<DealMode>("trade");
   const [selectedApt, setSelectedApt] = useState<SelectedApt | null>(null);
 
-  // ✅ "더 보기" 우측 사이드바 상태
-  const [tradePanelOpen, setTradePanelOpen] = useState(false);
-  const [tradePanelApt, setTradePanelApt] = useState<SelectedApt | null>(null);
+  const [panelOpen, setPanelOpen] = useState(false);
 
-  // 우측 패널이 열려있으면 선택 단지가 바뀔 때 자동으로 갱신
-  useEffect(() => {
-    if (!tradePanelOpen) return;
-    setTradePanelApt(selectedApt);
-  }, [selectedApt, tradePanelOpen]);
+  // ✅ lint(react-hooks/set-state-in-effect) 회피: 파생값으로 처리
+  const panelApt = useMemo(() => (panelOpen ? selectedApt : null), [panelOpen, selectedApt]);
 
-  const openTradePanel = () => {
+  const openPanel = () => {
     if (!selectedApt) return;
-    setTradePanelApt(selectedApt);
-    setTradePanelOpen(true);
+    setPanelOpen(true);
   };
 
-  const closeTradePanel = () => {
-    setTradePanelOpen(false);
-  };
+  const closePanel = () => setPanelOpen(false);
 
-  const leftPad = tradePanelOpen ? "pl-[840px]" : "pl-[420px]";
+  const leftPad = panelOpen ? "pl-[840px]" : "pl-[420px]";
 
   return (
     <main className="min-h-screen bg-gray-100">
-      <SidebarMain selectedApt={selectedApt} onOpenTradePanel={openTradePanel} />
+      <SidebarMain
+        selectedApt={selectedApt}
+        dealMode={dealMode}
+        onChangeDealMode={setDealMode}
+        onOpenTradePanel={openPanel}
+      />
 
-      {tradePanelOpen ? (
-        <SidebarTradeDetail
-          selectedApt={tradePanelApt}
-          onClose={closeTradePanel}
-        />
+      {panelOpen ? (
+        <SidebarTradeDetail selectedApt={panelApt} dealMode={dealMode} onClose={closePanel} />
       ) : null}
 
-      {/* 우측 지도 영역 */}
       <section className={`min-h-screen ${leftPad}`}>
         <div className="h-screen w-full bg-white">
-          <RightMapKakao onSelectApt={setSelectedApt} />
+          <RightMapKakao dealMode={dealMode} onSelectApt={setSelectedApt} />
         </div>
       </section>
     </main>
